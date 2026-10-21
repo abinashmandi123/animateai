@@ -5,6 +5,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,15 +30,51 @@ public class VideoGenerationService {
     }
 
     public VideoGenerationResult generateTestVideo() {
-        String fileName = "test-" + UUID.randomUUID() + ".mp4";
+        return generateVideo("test", null);
+    }
+
+    public VideoGenerationResult generateTextVideo(String text) {
+        return generateVideo("text", text);
+    }
+
+    private VideoGenerationResult generateVideo(String prefix, String text) {
+        String fileName = prefix + "-" + UUID.randomUUID() + ".mp4";
         Path outputFile = outputDirectory.resolve(fileName);
+        Path textFile = null;
+        Path fontFile = null;
         Process process = null;
         try {
             Files.createDirectories(outputDirectory);
-            ProcessBuilder builder = new ProcessBuilder(
+            List<String> command = new ArrayList<>(List.of(
                     "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-n",
-                    "-f", "lavfi", "-i", "color=c=blue:s=1280x720:d=5",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", outputFile.toString());
+                    "-f", "lavfi", "-i", text == null
+                            ? "color=c=blue:s=1280x720:d=5" : "color=c=0x151923:s=1280x720:d=5"));
+            if (text != null) {
+                textFile = Files.createTempFile(outputDirectory, "title-", ".txt");
+                Files.writeString(textFile, wrapTitle(text), StandardCharsets.UTF_8);
+                String filter = "drawtext=textfile=" + textFile.getFileName()
+                        + ":expansion=none:fontcolor=white:fontsize=40:line_spacing=12"
+                        + ":x=(w-text_w)/2:y=(h-text_h)/2";
+
+                // A local font filename avoids Windows drive-letter escaping in the filter.
+                String windowsDirectory = System.getenv("SystemRoot");
+                if (windowsDirectory != null) {
+                    Path arial = Path.of(windowsDirectory, "Fonts", "arial.ttf");
+                    if (Files.isRegularFile(arial)) {
+                        fontFile = Files.createTempFile(outputDirectory, "font-", ".ttf");
+                        Files.copy(arial, fontFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                        filter += ":fontfile=" + fontFile.getFileName();
+                    }
+                }
+                command.addAll(List.of("-vf", filter));
+            }
+            command.addAll(List.of("-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    text == null ? outputFile.toString() : outputFile.toAbsolutePath().toString()));
+            ProcessBuilder builder = new ProcessBuilder(command);
+            if (text != null) {
+                // Only generated basenames occur in the filter, never user text or absolute paths.
+                builder.directory(outputDirectory.toAbsolutePath().toFile());
+            }
             builder.redirectErrorStream(true);
             process = processStarter.start(builder);
 
@@ -65,6 +103,35 @@ public class VideoGenerationService {
         } finally {
             if (process != null && process.isAlive()) {
                 process.destroyForcibly();
+            }
+            deleteTemporaryFile(textFile);
+            deleteTemporaryFile(fontFile);
+        }
+    }
+
+    // Short lines keep even a 200-character title readable within the frame.
+    private String wrapTitle(String text) {
+        String remaining = text.strip().replaceAll("\\s+", " ");
+        List<String> lines = new ArrayList<>();
+        while (remaining.codePointCount(0, remaining.length()) > 28) {
+            int end = remaining.offsetByCodePoints(0, 28);
+            int space = remaining.lastIndexOf(' ', end);
+            if (space > 0) {
+                end = space;
+            }
+            lines.add(remaining.substring(0, end));
+            remaining = remaining.substring(end).stripLeading();
+        }
+        lines.add(remaining);
+        return String.join("\n", lines);
+    }
+
+    private void deleteTemporaryFile(Path file) {
+        if (file != null) {
+            try {
+                Files.deleteIfExists(file);
+            } catch (IOException ex) {
+                log.warn("Unable to remove temporary rendering file", ex);
             }
         }
     }
